@@ -161,6 +161,96 @@ def merge_overlapping_plates(plates):
     return merged
 
 
+def get_position_based_segments(h, w, offset_x=0):
+    """Get character segments based on Spanish plate format positions."""
+    # Spanish plate: [country ~12%] [4 numbers + 3 letters in remaining 88%]
+    country_width = int(w * 0.12)
+    char_zone_start = country_width
+    char_zone_width = w - country_width
+    
+    # 7 characters with some spacing
+    num_chars = 7
+    char_width = char_zone_width / num_chars
+    
+    # Character height is typically 40-70% of plate height, centered
+    char_height = int(h * 0.55)
+    char_y = int(h * 0.22)
+    
+    chars = []
+    for i in range(num_chars):
+        x_start = int(char_zone_start + i * char_width + char_width * 0.12)
+        x_end = int(char_zone_start + (i + 1) * char_width - char_width * 0.12)
+        
+        chars.append((x_start + offset_x, char_y, x_end - x_start, char_height))
+    
+    return chars
+
+
+def find_characters_in_image(gray_img, h, w, offset_x=0):
+    """Try multiple methods to find characters, with position-based fallback."""
+    
+    # Method 1: Adaptive threshold with CLAHE
+    denoised = cv2.GaussianBlur(gray_img, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    
+    # Try adaptive threshold
+    thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY_INV, 29, 5)
+    
+    kernel = np.ones((3, 3), np.uint8)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+    
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    candidates = []
+    for contour in contours:
+        x, y, cw, ch = cv2.boundingRect(contour)
+        aspect_ratio = cw / float(ch) if ch > 0 else 0
+        height_ratio = ch / float(h) if h > 0 else 0
+        
+        if 0.15 < aspect_ratio < 1.2 and 0.2 < height_ratio < 0.85 and cw > 8:
+            candidates.append((x + offset_x, y, cw, ch))
+    
+    # Method 2: Otsu threshold if adaptive didn't find enough
+    if len(candidates) < 5:
+        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        otsu_cleaned = cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernel)
+        
+        contours2, _ = cv2.findContours(otsu_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours2:
+            x, y, cw, ch = cv2.boundingRect(contour)
+            aspect_ratio = cw / float(ch) if ch > 0 else 0
+            height_ratio = ch / float(h) if h > 0 else 0
+            
+            if 0.15 < aspect_ratio < 1.2 and 0.2 < height_ratio < 0.85 and cw > 8:
+                candidates.append((x + offset_x, y, cw, ch))
+    
+    # Remove duplicates
+    unique_chars = []
+    for c in sorted(candidates, key=lambda x: x[2] * x[3], reverse=True):
+        cx, cy, cw, ch = c
+        is_overlap = False
+        for uc in unique_chars:
+            ux, uy, uw, uh = uc
+            overlap_x = max(0, min(cx + cw, ux + uw) - max(cx, ux))
+            if overlap_x > min(cw, uw) * 0.3:
+                is_overlap = True
+                break
+        if not is_overlap:
+            unique_chars.append(c)
+    
+    sorted_chars = sorted(unique_chars, key=lambda c: c[0])
+    
+    # Fallback: Use position-based segmentation if we didn't find enough characters
+    if len(sorted_chars) < 5:
+        sorted_chars = get_position_based_segments(h, w, offset_x)
+    
+    return sorted_chars
+
+
 def segment_plate_regions(plate_img):
     """Segment the plate into country band, letters, and numbers regions."""
     h, w = plate_img.shape[:2]
@@ -171,6 +261,11 @@ def segment_plate_regions(plate_img):
         'visualization': None
     }
     
+    if len(plate_img.shape) == 3:
+        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = plate_img.copy()
+    
     country_band_width = int(w * 0.12)
     if country_band_width > 5:
         segments['country_band'] = {
@@ -179,39 +274,21 @@ def segment_plate_regions(plate_img):
             'type': 'country'
         }
     
-    main_plate = plate_img[:, country_band_width:] if country_band_width > 5 else plate_img
-    main_w = main_plate.shape[1]
+    main_gray = gray[:, country_band_width:] if country_band_width > 5 else gray
+    main_w = main_gray.shape[1]
     
-    gray = cv2.cvtColor(main_plate, cv2.COLOR_BGR2GRAY)
-    
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
-    
-    _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    char_contours = []
-    for contour in contours:
-        x, y, cw, ch = cv2.boundingRect(contour)
-        aspect_ratio = cw / float(ch) if ch > 0 else 0
-        
-        if 0.1 < aspect_ratio < 1.5 and ch > h * 0.3 and ch < h * 0.95:
-            if cw > 5 and cw < main_w * 0.3:
-                char_contours.append((x + country_band_width, y, cw, ch))
-    
-    char_contours = sorted(char_contours, key=lambda c: c[0])
+    char_contours = find_characters_in_image(main_gray, h, main_w, country_band_width)
     
     for i, (x, y, cw, ch) in enumerate(char_contours):
+        if y + ch > h or x + cw > w:
+            continue
         char_region = plate_img[y:y+ch, x:x+cw]
+        
+        if char_region.size == 0:
+            continue
         
         relative_pos = (x - country_band_width) / main_w if main_w > 0 else 0
         
-        # Spanish plate format: NNNN LLL (4 numbers + 3 letters)
-        # Numbers are on the left (first ~55%), letters on the right
         if relative_pos < 0.55:
             char_type = 'number'
         else:
