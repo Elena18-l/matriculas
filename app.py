@@ -6,39 +6,159 @@ import io
 
 
 def preprocess_image(image):
-    """Convert image to grayscale and apply preprocessing for plate detection."""
+    """Convert image to grayscale and apply CLAHE for better contrast in low-light."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    return gray, blur
-
-
-def detect_license_plates(image):
-    """Detect potential license plate regions in the image."""
-    gray, blur = preprocess_image(image)
     
-    edges = cv2.Canny(blur, 50, 150)
+    bilateral = cv2.bilateralFilter(gray, 11, 17, 17)
+    
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(bilateral)
+    
+    return gray, enhanced
+
+
+def detect_license_plates_single_pass(enhanced, img_shape, canny_low=30, canny_high=150):
+    """Single detection pass with given parameters."""
+    edges = cv2.Canny(enhanced, canny_low, canny_high)
+    
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
     
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(closed, kernel_dilate, iterations=2)
+    
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     plates = []
-    img_height, img_width = image.shape[:2]
+    img_height, img_width = img_shape[:2]
     
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        aspect_ratio = w / float(h)
+        aspect_ratio = w / float(h) if h > 0 else 0
         area = w * h
         img_area = img_width * img_height
         area_ratio = area / img_area
         
-        if 2.0 < aspect_ratio < 6.0 and 0.005 < area_ratio < 0.15:
-            if w > 60 and h > 15:
+        if 1.5 < aspect_ratio < 7.0 and 0.002 < area_ratio < 0.25:
+            if w > 40 and h > 10:
                 plates.append((x, y, w, h))
     
-    plates = sorted(plates, key=lambda p: p[2] * p[3], reverse=True)
+    return plates
+
+
+def detect_plate_in_cropped_image(image):
+    """Detect if the whole image is essentially a license plate (cropped plate image)."""
+    h, w = image.shape[:2]
+    aspect_ratio = w / float(h) if h > 0 else 0
     
-    return plates[:5]
+    if 1.5 < aspect_ratio < 7.0:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_elements = 0
+        for contour in contours:
+            x, y, cw, ch = cv2.boundingRect(contour)
+            char_aspect = cw / float(ch) if ch > 0 else 0
+            height_ratio = ch / float(h)
+            width_ratio = cw / float(w)
+            
+            if ch > 10 and cw > 5:
+                if (0.1 < char_aspect < 2.0 and 0.15 < height_ratio < 0.9) or \
+                   (0.3 < width_ratio < 0.95 and 0.2 < height_ratio < 0.8):
+                    valid_elements += 1
+        
+        if valid_elements >= 1:
+            margin_x = int(w * 0.02)
+            margin_y = int(h * 0.05)
+            return [(margin_x, margin_y, w - 2*margin_x, h - 2*margin_y)]
+    
+    return []
+
+
+def detect_license_plates(image):
+    """Detect potential license plate regions using multiple preprocessing techniques."""
+    gray, enhanced = preprocess_image(image)
+    img_shape = image.shape
+    img_h, img_w = img_shape[:2]
+    
+    all_plates = []
+    
+    plates1 = detect_license_plates_single_pass(enhanced, img_shape, 30, 150)
+    all_plates.extend(plates1)
+    
+    plates2 = detect_license_plates_single_pass(enhanced, img_shape, 50, 200)
+    all_plates.extend(plates2)
+    
+    adaptive = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, 11, 2
+    )
+    plates3 = detect_license_plates_single_pass(adaptive, img_shape, 50, 150)
+    all_plates.extend(plates3)
+    
+    _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    plates4 = detect_license_plates_single_pass(otsu, img_shape, 50, 150)
+    all_plates.extend(plates4)
+    
+    merged_plates = merge_overlapping_plates(all_plates)
+    
+    if not merged_plates:
+        cropped_plates = detect_plate_in_cropped_image(image)
+        if cropped_plates:
+            return cropped_plates
+    
+    merged_plates = sorted(merged_plates, key=lambda p: p[2] * p[3], reverse=True)
+    
+    return merged_plates[:5]
+
+
+def merge_overlapping_plates(plates):
+    """Merge overlapping plate detections."""
+    if not plates:
+        return []
+    
+    plates = list(set(plates))
+    
+    merged = []
+    used = [False] * len(plates)
+    
+    for i, (x1, y1, w1, h1) in enumerate(plates):
+        if used[i]:
+            continue
+        
+        current_x, current_y = x1, y1
+        current_w, current_h = w1, h1
+        
+        for j, (x2, y2, w2, h2) in enumerate(plates):
+            if i == j or used[j]:
+                continue
+            
+            overlap_x = max(0, min(current_x + current_w, x2 + w2) - max(current_x, x2))
+            overlap_y = max(0, min(current_y + current_h, y2 + h2) - max(current_y, y2))
+            overlap_area = overlap_x * overlap_y
+            
+            area1 = current_w * current_h
+            area2 = w2 * h2
+            min_area = min(area1, area2)
+            
+            if overlap_area > 0.3 * min_area:
+                new_x = min(current_x, x2)
+                new_y = min(current_y, y2)
+                new_w = max(current_x + current_w, x2 + w2) - new_x
+                new_h = max(current_y + current_h, y2 + h2) - new_y
+                current_x, current_y = new_x, new_y
+                current_w, current_h = new_w, new_h
+                used[j] = True
+        
+        merged.append((current_x, current_y, current_w, current_h))
+        used[i] = True
+    
+    return merged
 
 
 def segment_plate_regions(plate_img):
@@ -63,7 +183,11 @@ def segment_plate_regions(plate_img):
     main_w = main_plate.shape[1]
     
     gray = cv2.cvtColor(main_plate, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    enhanced = clahe.apply(gray)
+    
+    _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
